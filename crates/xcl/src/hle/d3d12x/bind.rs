@@ -5072,10 +5072,9 @@ mod tests {
     }
 
     /// A dispatch writes an ExecuteIndirect's group count through another buffer over the same
-    /// memory (as translated shaders write through the memory windows), a UAV barrier (what a
-    /// console barrier becomes), then the ExecuteIndirect: it runs the count just written, not
-    /// the one the memory held before the list (`fresh_indirect_arguments`; without it an RTX
-    /// 5090 ran the old count in nearly every try).
+    /// memory (as translated shaders write through the memory windows), then the ExecuteIndirect
+    /// runs the count just written. The test orders the placed aliases explicitly so the driver
+    /// sees valid D3D12 accesses before `fresh_indirect_arguments` runs.
     #[test]
     fn execute_indirect_reads_the_arguments_written_before_it() {
         use crate::gpu::{fence, recomp::runner::skip_test};
@@ -5105,7 +5104,8 @@ void main(uint t : SV_GroupIndex) {
         unsafe {
             let setup = || -> Result<(ID3D12Device, String), String> {
                 let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI factory unavailable: {e}"))?;
-                let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+                // The driver-specific probe runs on hardware only when selected explicitly.
+                let sel = crate::gpu::adapter::Selector::from_env_or("warp");
                 let (adapter, name): (IDXGIAdapter1, String) = if sel == crate::gpu::adapter::Selector::Warp {
                     (factory.EnumWarpAdapter().map_err(|e| format!("WARP unavailable: {e}"))?, "WARP (software renderer)".into())
                 } else {
@@ -5173,6 +5173,13 @@ void main(uint t : SV_GroupIndex) {
                 Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }) },
             };
+            // D3D12 requires an aliasing barrier for the switch from `written` to `args`
+            // inside one ExecuteCommandLists call, even for buffers that inherit bytes.
+            let alias_barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { Aliasing: ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER::default()) },
+            };
             let run = |list: &ID3D12GraphicsCommandList, close: &dyn Fn()| {
                 close();
                 queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
@@ -5199,7 +5206,7 @@ void main(uint t : SV_GroupIndex) {
                 alloc.Reset().unwrap();
                 *count = 0;
                 let list = record(new);
-                list.ResourceBarrier(&[uav_barrier.clone()]);
+                list.ResourceBarrier(&[uav_barrier.clone(), alias_barrier.clone()]);
                 list.SetComputeRoot32BitConstants(0, 2, [1u32, 0].as_ptr() as _, 0);
                 // from here as XCL records a title's ExecuteIndirect: on the adopted list
                 let raw = list.as_raw();
