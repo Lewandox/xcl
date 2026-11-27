@@ -289,6 +289,24 @@ fn inline_guard_batch_on() -> bool {
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
 /// two-pass ExecuteIndirects are skipped)
 const SCRATCH_BLOCK: u64 = 1 << 20;
+/// The first block of a recording's slot: 512 arguments of 256 bytes. A retail title's world has
+/// some 130 recordings a frame alive for several frames, most with a few indirect calls: at
+/// `SCRATCH_BLOCK` each, 493 blocks were made in 15 s and stayed alive (493 MiB of video memory,
+/// and as much commit). A slot that fills its first block goes on in `SCRATCH_BLOCK`s.
+const SCRATCH_FIRST_BLOCK: u64 = 128 << 10;
+
+/// The bytes of the block a slot takes for `bytes` of arguments: its first one small, the ones
+/// after it `SCRATCH_BLOCK`, and never less than what is asked.
+fn scratch_block_bytes(bytes: u64, first: bool) -> u64 {
+    bytes.max(if first { SCRATCH_FIRST_BLOCK } else { SCRATCH_BLOCK })
+}
+
+/// The free block (`FREE_RES`: buffer, bytes, device) to take for `size` bytes with `remaining`
+/// left of the recording's cap: the smallest that holds them, so a small first block does not
+/// take a record buffer of megabytes that the next two-pass draw then makes anew.
+fn pick_free_block(free: &[(u64, usize)], dev: usize, size: u64, remaining: u64) -> Option<usize> {
+    free.iter().enumerate().filter(|(_, (cap, d))| *d == dev && *cap >= size && *cap <= remaining).min_by_key(|(_, (cap, _))| *cap).map(|(i, _)| i)
+}
 /// Default per-recording cap on rewritten indirect-argument scratch (MiB). Overridable via
 /// `XCL_INDIRECT_SCRATCH_MB` (clamped 4..=128 MiB) so dense open-world indirect draw lists do
 /// not exhaust scratch mid-recording and drop trailing draws.
@@ -2401,7 +2419,7 @@ unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u6
     }) {
         return Ok(r);
     }
-    let size = bytes.max(SCRATCH_BLOCK);
+    let size = scratch_block_bytes(bytes, with(this, |s| s.prelude_scratch.buf.is_none()));
     let cap = scratch_cap();
     let remaining = cap.saturating_sub(with(this, |s| s.scratch_taken));
     if size > remaining {
@@ -2410,7 +2428,8 @@ unsafe fn alloc_prelude_scratch(this: *mut c_void, dev: &ID3D12Device, bytes: u6
     let dev_key = dev.as_raw() as usize;
     let picked = {
         let mut free = FREE_RES.lock().unwrap();
-        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= size && *cap <= remaining).map(|i| free.swap_remove(i))
+        let shapes: Vec<(u64, usize)> = free.iter().map(|(_, cap, d)| (*cap, *d)).collect();
+        pick_free_block(&shapes, dev_key, size, remaining).map(|i| free.swap_remove(i))
     };
     let block = match picked {
         Some(e) => e,
@@ -3282,7 +3301,7 @@ unsafe fn scratch_args_in(this: *mut c_void, dev: &ID3D12Device, bytes: u64, slo
     }) {
         return Ok(r);
     }
-    let size = bytes.max(SCRATCH_BLOCK);
+    let size = scratch_block_bytes(bytes, with(this, |s| s.scratch[slot].buf.is_none()));
     let cap = scratch_cap();
     let remaining = cap.saturating_sub(with(this, |s| s.scratch_taken));
     if size > remaining {
@@ -3291,7 +3310,8 @@ unsafe fn scratch_args_in(this: *mut c_void, dev: &ID3D12Device, bytes: u64, slo
     let dev_key = dev.as_raw() as usize;
     let picked = {
         let mut free = FREE_RES.lock().unwrap();
-        free.iter().position(|(_, cap, d)| *d == dev_key && *cap >= size && *cap <= remaining).map(|i| free.swap_remove(i))
+        let shapes: Vec<(u64, usize)> = free.iter().map(|(_, cap, d)| (*cap, *d)).collect();
+        pick_free_block(&shapes, dev_key, size, remaining).map(|i| free.swap_remove(i))
     };
     let block = match picked {
         Some(e) => e,
@@ -4978,6 +4998,27 @@ mod tests {
         assert_eq!(two_pass_list_mb(Some("0")), 32);
         assert_eq!(two_pass_list_mb(Some("x")), 32);
         assert_eq!(two_pass_list_mb(Some("1000")), 128);
+    }
+
+    /// A slot's first block of rewritten arguments is small, the ones after it are
+    /// `SCRATCH_BLOCK`, a request larger than either gets its own size; and a free block is
+    /// taken smallest first, of the same device, within what the recording may still take.
+    #[test]
+    fn a_recordings_first_argument_block_is_small_and_free_blocks_go_smallest_first() {
+        assert_eq!(scratch_block_bytes(256, true), SCRATCH_FIRST_BLOCK);
+        assert_eq!(scratch_block_bytes(256, false), SCRATCH_BLOCK);
+        assert_eq!(scratch_block_bytes(SCRATCH_FIRST_BLOCK + 256, true), SCRATCH_FIRST_BLOCK + 256);
+        assert_eq!(scratch_block_bytes(4 << 20, true), 4 << 20);
+        assert_eq!(scratch_block_bytes(4 << 20, false), 4 << 20);
+        assert!(SCRATCH_FIRST_BLOCK < SCRATCH_BLOCK && SCRATCH_FIRST_BLOCK % 256 == 0);
+        // (bytes, device): a 32 MiB record buffer, two blocks, one of another device
+        let free = [(32u64 << 20, 7usize), (1 << 20, 7), (128 << 10, 7), (128 << 10, 9)];
+        assert_eq!(pick_free_block(&free, 7, 128 << 10, 32 << 20), Some(2));
+        assert_eq!(pick_free_block(&free, 7, 512 << 10, 32 << 20), Some(1));
+        assert_eq!(pick_free_block(&free, 7, 2 << 20, 32 << 20), Some(0));
+        // the record buffer is past what the recording may still take
+        assert_eq!(pick_free_block(&free, 7, 2 << 20, 16 << 20), None);
+        assert_eq!(pick_free_block(&free, 8, 256, 32 << 20), None);
     }
 
     #[test]
