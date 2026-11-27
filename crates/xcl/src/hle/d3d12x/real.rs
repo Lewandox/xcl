@@ -7021,39 +7021,47 @@ enum OwnedDesc {
 
 /// A pipeline's copy of one of its console shaders, shared with every pipeline that copied the
 /// same bytes (`intern_blob`).
-type Blob = std::sync::Arc<[u8]>;
+struct Blob {
+    bytes: std::sync::Arc<[u8]>,
+    hash: u64,
+}
 
-/// The copies kept: (title address, length) → the copy, while a pipeline holds it.
-static BLOBS: Mutex<Option<(HashMap<(usize, usize), std::sync::Weak<[u8]>>, usize)>> = Mutex::new(None);
+/// The copies kept by hash and length while a pipeline holds them. Collisions share a bucket.
+type BlobBuckets = HashMap<(u64, usize), Vec<std::sync::Weak<[u8]>>>;
+static BLOBS: Mutex<Option<(BlobBuckets, usize)>> = Mutex::new(None);
 
-/// The copy of the shader `bytes` a pipeline keeps until it is built: the one an earlier
-/// pipeline made of the same bytes at the same address, or a new one. A retail title makes
-/// ~80 000 pipelines in its first minute from a few thousand shaders, and every one waiting to
-/// be built (`pso_async::lazy`) held copies of its own. (Equal bytes are checked: an address
-/// the title used again for another shader gets a copy of its own.)
+/// Share each distinct shader across pipeline descriptors, even when the title copied it to
+/// multiple addresses. Keep the hash for the pipeline's shader keys.
 fn intern_blob(bytes: &[u8]) -> Blob {
-    let key = (bytes.as_ptr() as usize, bytes.len());
+    intern_hashed_blob(bytes, crate::gpu::shader::fnv64(bytes))
+}
+
+fn intern_hashed_blob(bytes: &[u8], hash: u64) -> Blob {
+    let key = (hash, bytes.len());
     let mut g = BLOBS.lock().unwrap();
     let (m, since_prune) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if let Some(b) = m.get(&key).and_then(std::sync::Weak::upgrade) {
-        if *b == *bytes {
-            return b;
-        }
+    let bucket = m.entry(key).or_default();
+    if let Some(bytes) = bucket.iter().filter_map(std::sync::Weak::upgrade).find(|b| b.as_ref() == bytes) {
+        return Blob { bytes, hash };
     }
-    let b: Blob = std::sync::Arc::from(bytes);
-    m.insert(key, std::sync::Arc::downgrade(&b));
+    let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+    bucket.retain(|w| w.strong_count() > 0);
+    bucket.push(std::sync::Arc::downgrade(&bytes));
     *since_prune += 1;
     if *since_prune >= 4096 {
         *since_prune = 0;
-        m.retain(|_, w| w.strong_count() > 0);
+        m.retain(|_, bucket| {
+            bucket.retain(|w| w.strong_count() > 0);
+            !bucket.is_empty()
+        });
     }
-    b
+    Blob { bytes, hash }
 }
 
 /// The shader copies pipelines hold (`intern_blob`): how many and their bytes.
 pub fn pipeline_blob_bytes() -> (usize, usize) {
     BLOBS.lock().unwrap().as_ref().map_or((0, 0), |(m, _)| {
-        m.values().filter_map(std::sync::Weak::upgrade).fold((0, 0), |(n, b), x| (n + 1, b + x.len()))
+        m.values().flatten().filter_map(std::sync::Weak::upgrade).fold((0, 0), |(n, b), x| (n + 1, b + x.len()))
     })
 }
 
@@ -7063,19 +7071,49 @@ unsafe impl Send for OwnedDesc {}
 /// pipeline by in the next run.
 /// `shaders_key` of the one shader `blob`.
 pub(crate) fn shader_key(blob: &[u8]) -> u64 {
-    ((0xcbf2_9ce4_8422_2325u64 ^ crate::gpu::shader::fnv64(blob)).wrapping_mul(0x0000_0100_0000_01b3)) | 1
+    shader_set_key([crate::gpu::shader::fnv64(blob)])
 }
 
 pub(crate) fn shaders_key<B: AsRef<[u8]>>(blobs: &[B]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for b in blobs {
-        h = (h ^ crate::gpu::shader::fnv64(b.as_ref())).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h | 1
+    shader_set_key(blobs.iter().map(|b| crate::gpu::shader::fnv64(b.as_ref())))
+}
+
+fn shader_set_key(hashes: impl IntoIterator<Item = u64>) -> u64 {
+    hashes.into_iter().fold(0xcbf2_9ce4_8422_2325u64, |key, hash| (key ^ hash).wrapping_mul(0x0000_0100_0000_01b3)) | 1
 }
 
 #[cfg(test)]
 mod shaders_key_tests {
+    #[test]
+    fn lazy_pipelines_share_identical_shader_bytes_at_distinct_addresses() {
+        let a = vec![1, 2, 3, 4];
+        let mut b = a.clone();
+        assert_ne!(a.as_ptr(), b.as_ptr());
+
+        let first = super::intern_blob(&a);
+        let second = super::intern_blob(&b);
+        assert!(std::sync::Arc::ptr_eq(&first.bytes, &second.bytes));
+
+        b[0] = 5;
+        let changed = super::intern_blob(&b);
+        assert!(!std::sync::Arc::ptr_eq(&first.bytes, &changed.bytes));
+        assert_eq!(&*first.bytes, &a);
+        assert_eq!(&*changed.bytes, &b);
+        assert_eq!(super::shader_set_key([first.hash, changed.hash]), super::shaders_key(&[a, b.clone()]));
+        b[0] = 1;
+        assert!(std::sync::Arc::ptr_eq(&first.bytes, &super::intern_blob(&b).bytes));
+    }
+
+    #[test]
+    fn same_length_shader_hash_collisions_keep_distinct_bytes() {
+        let first = super::intern_hashed_blob(b"abc", u64::MAX);
+        let second = super::intern_hashed_blob(b"def", u64::MAX);
+        assert_eq!(&*first.bytes, b"abc");
+        assert_eq!(&*second.bytes, b"def");
+        assert!(std::sync::Arc::ptr_eq(&first.bytes, &super::intern_hashed_blob(b"abc", u64::MAX).bytes));
+        assert!(std::sync::Arc::ptr_eq(&second.bytes, &super::intern_hashed_blob(b"def", u64::MAX).bytes));
+    }
+
     #[test]
     fn the_key_of_one_shader_is_the_key_of_a_set_of_it() {
         let a = vec![1u8, 2, 3];
@@ -7103,10 +7141,10 @@ impl OwnedDesc {
             OwnedDesc::Graphics(_, b, ..) => b,
             OwnedDesc::Stream(_, _, b) => b,
         };
-        let key = shaders_key(blobs);
+        let key = shader_set_key(blobs.iter().map(|b| b.hash));
         // each shader by itself too: what a title's shader preparation translates before the
         // next run (`pso_async::earlier_used_shaders`)
-        let parts: Vec<u64> = blobs.iter().map(|b| shader_key(b)).collect();
+        let parts: Vec<u64> = blobs.iter().map(|b| shader_set_key([b.hash])).collect();
         super::pso_async::shaders_of(key, parts.clone());
         (key, parts)
     }
@@ -7140,7 +7178,7 @@ unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Blob>) {
     if let Some(bytes) = shader_bytes(b) {
         blobs.push(intern_blob(bytes));
         let v = blobs.last().unwrap();
-        *b = bytecode(v);
+        *b = bytecode(&v.bytes);
     } else {
         *b = D3D12_SHADER_BYTECODE::default();
     }
@@ -7209,7 +7247,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
                     buf[at..at + 16].fill(0);
                 } else if crate::gpu::shader::readable(p, n) {
                     blobs.push(intern_blob(std::slice::from_raw_parts(p as *const u8, n)));
-                    buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
+                    buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().bytes.as_ptr() as u64).to_le_bytes());
                 } else {
                     return None;
                 }
@@ -7352,17 +7390,17 @@ unsafe fn go_background(
     // (a graphics pipeline used in this run is built before the next starts: `gfx_records`)
     let described = if super::pso_async::lazy() { owned.record(key, &parts) } else { None };
     // a big compute program that writes nothing but images: binds can go on without it
-    let big_image_only = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
+    let big_image_only = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(&b.bytes)));
     let image_only = big_image_only && super::pso_async::image_skip();
-    let bvh_trav = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| is_rt_gated_cs(b)));
+    let bvh_trav = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| is_rt_gated_cs(&b.bytes)));
     let heavy_compute = compute
         && super::pso_async::async_heavy_compute()
-        && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::compute_code_len(b).is_some_and(|n| n >= crate::gpu::effects::HEAVY_CODE)));
-    let ambient_cs = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| super::ambient::is_ambient_compute(b)));
+        && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::compute_code_len(&b.bytes).is_some_and(|n| n >= crate::gpu::effects::HEAVY_CODE)));
+    let ambient_cs = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| super::ambient::is_ambient_compute(&b.bytes)));
     if compute {
         if let OwnedDesc::Compute(_, b) = &owned {
             if let Some(cs) = b.first() {
-                note_compute_threads(*ppv as usize, cs);
+                note_compute_threads(*ppv as usize, &cs.bytes);
             }
         }
         if bvh_trav {
@@ -10858,9 +10896,9 @@ mod mesh_stream_tests {
             let owned = own_stream(d_valid.as_ptr() as *const c_void).expect("valid stream");
             let OwnedDesc::Stream(_, buf, blobs) = owned else { panic!("expected Stream") };
             assert_eq!(blobs.len(), 1);
-            assert_eq!(&*blobs[0], &shader[..]);
+            assert_eq!(&*blobs[0].bytes, &shader[..]);
             let rebased = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
-            assert_eq!(rebased, blobs[0].as_ptr() as usize);
+            assert_eq!(rebased, blobs[0].bytes.as_ptr() as usize);
             assert_ne!(rebased, shader.as_ptr() as usize);
             assert_eq!(&buf[32..48], &[0u8; 16], "zero-len shader entry cleared");
             assert_eq!(&buf[56..72], &[0u8; 16], "cached PSO cleared");
