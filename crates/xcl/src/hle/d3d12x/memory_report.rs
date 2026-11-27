@@ -171,15 +171,40 @@ pub fn snapshot() -> Snapshot {
     Snapshot { commit: process_commit(), local, non_local, parts }
 }
 
+/// What a committed region is counted as in `walk_line`'s memory in RAM.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind2 {
+    Coherent,
+    Sparse,
+    Private,
+    Mapped,
+    Image,
+}
+
+/// One page in sixteen of the committed regions is asked about (`QueryWorkingSetEx`): committed
+/// memory is what Windows promised, and what a machine runs out of is the memory in RAM – a
+/// retail title's world load ended, every time, with 1.5 to 3 GB of RAM free.
+const SAMPLE: usize = 0x1_0000;
+
+/// The bytes each sample stands for that are in RAM: `samples` are (address, bytes it stands
+/// for), `valid` says whether the page at an address is in the working set.
+fn resident(samples: &[(usize, u64)], valid: impl Fn(usize) -> bool) -> u64 {
+    samples.iter().enumerate().filter(|(i, _)| valid(*i)).map(|(_, s)| s.1).sum()
+}
+
 /// The process's address space, walked (`VirtualQuery`): its committed private memory outside
 /// the unified-memory block by allocation, the largest ones, and the rest by size; mapped and
 /// image memory. What `snapshot`'s "other" holds, for finding its owner (the title's heaps, the
-/// driver's, XCL's).
+/// driver's, XCL's). Then how much of each is in RAM, by a sample (`SAMPLE`), and the private
+/// allocations with the most there.
 pub fn walk_line() -> String {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE};
     let u = crate::gpu::uma::get();
     let t0 = std::time::Instant::now();
     let (mut uma, mut mapped, mut image, mut regions) = (0u64, 0u64, 0u64, 0usize);
+    // (address, bytes it stands for), what it is, its allocation
+    let mut samples: Vec<(usize, u64)> = Vec::new();
+    let mut sample_of: Vec<(Kind2, usize)> = Vec::new();
     let mut by_base: std::collections::HashMap<usize, (u64, u32, u32)> = std::collections::HashMap::new();
     let mut at = 0x1_0000usize;
     while at < 0x7FFF_FFFE_0000 {
@@ -191,6 +216,22 @@ pub fn walk_line() -> String {
         let (base, size) = (m.BaseAddress as usize, m.RegionSize);
         if m.State == MEM_COMMIT {
             let n = size as u64;
+            let kind = if u.is_some_and(|u| u.contains(base)) {
+                if u.is_some_and(|u| u.is_sparse(base)) { Kind2::Sparse } else { Kind2::Coherent }
+            } else if m.Type == MEM_PRIVATE {
+                Kind2::Private
+            } else if m.Type == MEM_MAPPED {
+                Kind2::Mapped
+            } else {
+                Kind2::Image
+            };
+            let mut a = base;
+            while a < base + size {
+                let stands_for = SAMPLE.min(base + size - a) as u64;
+                samples.push((a, stands_for));
+                sample_of.push((kind, m.AllocationBase as usize));
+                a += SAMPLE;
+            }
             if u.is_some_and(|u| u.contains(base)) {
                 uma += n;
             } else if m.Type == MEM_PRIVATE {
@@ -208,6 +249,33 @@ pub fn walk_line() -> String {
             _ => break,
         }
     }
+    // which of the sampled pages are in RAM
+    let in_ram = unsafe {
+        use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+        let mut info: Vec<PSAPI_WORKING_SET_EX_INFORMATION> = samples.iter().map(|s| { let mut i: PSAPI_WORKING_SET_EX_INFORMATION = std::mem::zeroed(); i.VirtualAddress = s.0 as *mut _; i }).collect();
+        let bytes = (info.len() * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+        let ok = !info.is_empty() && K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), info.as_mut_ptr().cast(), bytes) != 0;
+        let valid: Vec<bool> = info.iter().map(|i| ok && i.VirtualAttributes.Flags & 1 != 0).collect();
+        valid
+    };
+    let ram_of = |k: Kind2| resident(&samples, |i| in_ram[i] && sample_of[i].0 == k);
+    let mut ram_by_base: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+    for (i, s) in samples.iter().enumerate() {
+        if in_ram[i] && sample_of[i].0 == Kind2::Private {
+            *ram_by_base.entry(sample_of[i].1).or_default() += s.1;
+        }
+    }
+    let mut ram_top: Vec<(usize, u64)> = ram_by_base.into_iter().collect();
+    ram_top.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    let ram_line = format!(
+        "; in RAM (one page in 16 asked): unified coherent {}, sparse {}; private elsewhere {} – most {}; mapped {}, images {}",
+        ram_of(Kind2::Coherent) >> 20,
+        ram_of(Kind2::Sparse) >> 20,
+        ram_of(Kind2::Private) >> 20,
+        ram_top.iter().take(10).map(|&(b, n)| format!("{b:#x} {}", n >> 20)).collect::<Vec<_>>().join(", "),
+        ram_of(Kind2::Mapped) >> 20,
+        ram_of(Kind2::Image) >> 20
+    );
     let mut all: Vec<(usize, u64, u32, u32)> = by_base.into_iter().map(|(b, (n, r, p))| (b, n, r, p)).collect();
     all.sort_unstable_by(|a, b| b.1.cmp(&a.1));
     let private: u64 = all.iter().map(|a| a.1).sum();
@@ -243,12 +311,29 @@ pub fn walk_line() -> String {
         sizes[3].0,
         mb(mapped),
         mb(image)
-    )
+    ) + &ram_line
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sample counts with the bytes it stands for when its page is in RAM; the walk's line
+    /// names what is there.
+    #[test]
+    fn memory_in_ram_is_the_sum_of_the_samples_whose_pages_are_there() {
+        let samples = [(0x1_0000usize, 0x1_0000u64), (0x2_0000, 0x1_0000), (0x3_0000, 0x4000)];
+        assert_eq!(resident(&samples, |_| true), 0x2_4000);
+        assert_eq!(resident(&samples, |i| i != 1), 0x1_4000);
+        assert_eq!(resident(&samples, |_| false), 0);
+        // this process: memory just written is in RAM, and the line says how much is
+        let block = vec![1u8; 8 << 20];
+        let line = walk_line();
+        assert!(line.contains("in RAM (one page in 16 asked)") && line.contains("private elsewhere"), "{line}");
+        let private: u64 = line.split("; in RAM").nth(1).and_then(|r| r.split("private elsewhere ").nth(1)).and_then(|r| r.split(' ').next()).and_then(|n| n.parse().ok()).expect("a number");
+        assert!(private >= 8, "{private} MB of private memory in RAM with 8 MB just written: {line}");
+        drop(block);
+    }
 
     /// The rest of each total is its total less its parts, a part is counted on its side only,
     /// and the line shows every part, each total against its budget, and the rest.
