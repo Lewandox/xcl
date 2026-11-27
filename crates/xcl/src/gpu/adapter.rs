@@ -149,6 +149,22 @@ pub fn candidates(factory: &IDXGIFactory6, sel: &Selector) -> Vec<(IDXGIAdapter1
     hw.into_iter().enumerate().filter(|(i, _)| keep[*i]).map(|(_, a)| a).collect()
 }
 
+/// The PCI vendor of the adapter the device is made on: the first one `configured`
+/// (`d3d12_adapter`) or `XCL_ADAPTER` allows, else the first hardware one, as the device's
+/// creation picks it. `None` for `warp` or with no hardware adapter.
+pub fn chosen_vendor(configured: &str) -> Option<u32> {
+    let sel = Selector::from_env_or(configured);
+    if sel == Selector::Warp {
+        return None;
+    }
+    let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.ok()?;
+    let mut list = candidates(&factory, &sel);
+    if list.is_empty() {
+        list = candidates(&factory, &Selector::Auto);
+    }
+    list.first().map(|(_, desc)| desc.VendorId)
+}
+
 /// "`sel` matches no adapter (have: 0 = …, 1 = …)" – for logs and test skips.
 pub fn no_match(factory: &IDXGIFactory6, sel: &Selector) -> String {
     let have: Vec<String> = hardware(factory).iter().enumerate().map(|(i, (_, d))| format!("{i} = {}", name(d))).collect();

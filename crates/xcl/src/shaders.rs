@@ -1127,7 +1127,7 @@ enum MeasureError {
 /// Compile one exact console compute shader through DXC, then time only the driver's
 /// `CreateComputePipelineState`. The implicit D3D and driver caches must both be disabled;
 /// refusing to do that is an error rather than a misleading warm-cache measurement.
-/// This is the HLSL path the runtime uses by default (not `XCL_DIRECT_DXIL`).
+/// The measurement always uses the HLSL path, independently of `XCL_DIRECT_DXIL`.
 fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>) -> i32 {
     match measure_pso_result(input, hash, repeat, windows, split) {
         Ok(()) => 0,
@@ -1804,7 +1804,7 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
     progress.total.store(inputs.iter().map(Input::len).sum(), Ordering::Relaxed);
     let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
     if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
-    let workers = prepare_workers();
+    let workers = prepare_workers(&progress.adapter);
     for input in &inputs {
         if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
         // a pack: its stages here, its compute pipelines in worker processes (the driver builds
@@ -1829,14 +1829,25 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
 
 /// `XCL_PREPARE_WORKERS`: the processes that build a pack's compute pipelines before a title
 /// starts (1: in this process, as before). Unset: the logical processors less four, and no
-/// more than 3 GB of the commit the system has left for each.
-fn prepare_workers() -> usize {
+/// more than 3 GB of the commit the system has left for each, and no more than the driver of
+/// the adapter `adapter` chooses gives a device (`workers_with_devices`).
+fn prepare_workers(adapter: &str) -> usize {
     if let Some(n) = std::env::var("XCL_PREPARE_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()) {
         return n.clamp(1, 32);
     }
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let (used, limit) = crate::host::system_commit();
-    workers_for(cores, limit.saturating_sub(used))
+    workers_with_devices(workers_for(cores, limit.saturating_sub(used)), crate::gpu::adapter::chosen_vendor(adapter))
+}
+
+/// The processes an AMD driver gives a D3D12 device at one time (Adrenalin 26.11.2, RX 9070:
+/// `D3D12CreateDevice` in a tenth process fails with 0x887A0005, the worker ends without having
+/// built anything and the driver tells the user of an error).
+const AMD_DEVICE_PROCESSES: usize = 9;
+
+/// The workers that get a device beside the title's own on an adapter of PCI vendor `vendor`.
+fn workers_with_devices(workers: usize, vendor: Option<u32>) -> usize {
+    if vendor == Some(0x1002) { workers.min(AMD_DEVICE_PROCESSES - 1) } else { workers }
 }
 
 /// The workers for `cores` logical processors (threads, not cores) and `free_mb` of commit left.
@@ -2798,6 +2809,17 @@ mod tests {
         assert_eq!(workers_for(2, 100_000), 1);
         assert_eq!(workers_for(64, 1_000_000), 32);
         assert_eq!(workers_for(32, 0), 1);
+    }
+
+    /// An AMD driver gives nine processes a device at one time: the title and eight workers.
+    /// Other vendors' drivers keep the count the processors and the commit give.
+    #[test]
+    fn preparation_workers_on_amd_leave_the_title_its_device() {
+        assert_eq!(workers_with_devices(12, Some(0x1002)), 8);
+        assert_eq!(workers_with_devices(10, Some(0x1002)), 8);
+        assert_eq!(workers_with_devices(4, Some(0x1002)), 4);
+        assert_eq!(workers_with_devices(28, Some(0x10de)), 28);
+        assert_eq!(workers_with_devices(28, None), 28);
     }
 
     /// A builder's progress line gives its record count; its other lines give none.
