@@ -131,7 +131,16 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     }
     super::real::stop_if_device_removed();
     super::alloc_pool::release_finished();
-    crate::gpu::texture::trim_idle_staging(frames, super::vram::commit_low());
+    let low_commit = super::vram::commit_low();
+    crate::gpu::texture::trim_idle_staging(frames, low_commit);
+    if let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&queue).filter(|_| low_commit) {
+        let mut dev: Option<ID3D12Device> = None;
+        if queue.GetDevice(&mut dev).is_ok() {
+            if let Some(dev) = dev {
+                super::bind::trim_free_scratch(dev.as_raw() as usize);
+            }
+        }
+    }
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }

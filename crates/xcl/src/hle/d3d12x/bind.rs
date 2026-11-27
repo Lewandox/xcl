@@ -465,6 +465,14 @@ fn recycle_into_pool<T>(free: &Mutex<Vec<T>>, items: Vec<T>, mut keep: impl FnMu
     drop(overflow);
 }
 
+/// Give back scratch that completed recordings returned to the reuse pools. Drop COM objects
+/// outside the locks because their release hooks can re-enter `release_allocator_res`.
+pub(super) fn trim_free_scratch(dev_key: usize) {
+    let buffers: Vec<_> = FREE_RES.lock().unwrap().extract_if(.., |(_, _, dev)| *dev == dev_key).collect();
+    let io: Vec<_> = FREE_IO.lock().unwrap().extract_if(.., |block| block.dev_key == dev_key).collect();
+    drop((buffers, io));
+}
+
 pub(super) fn release_allocator_res(allocator: usize) {
     // Bind each removed entry before locking the free pool (avoiding nested `ALLOC_* -> FREE_*`
     // lock holding from `if let` temporary lifetimes) and drop overflow COM objects outside both
@@ -7036,6 +7044,38 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
         let records = [(u32::MAX, u32::MAX), (3000, 4), (DRAW_VERTS_PER_INST_LIMIT, 1), (1024, 16)];
         let rejected: Vec<bool> = records.iter().map(|&(v, i)| draw_record_rejected(v, i)).collect();
         assert_eq!(rejected, vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn trimming_free_scratch_releases_only_the_requested_devices_idle_buffers() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else {
+                crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                return;
+            };
+            let buffer = default_uav_buffer(&dev, IO_BLOCK_BYTES, "test scratch").unwrap();
+            let (trimmed, other, allocator) = (0x7500_1030, 0x7500_1031, 0x7500_1032);
+            FREE_RES.lock().unwrap().extend([
+                (buffer.clone(), IO_BLOCK_BYTES, trimmed),
+                (buffer.clone(), IO_BLOCK_BYTES, other),
+            ]);
+            ALLOC_RES.lock().unwrap().get_or_insert_with(HashMap::new).insert(allocator, vec![(buffer, IO_BLOCK_BYTES, trimmed)]);
+
+            trim_free_scratch(trimmed);
+            {
+                let free = FREE_RES.lock().unwrap();
+                assert!(!free.iter().any(|entry| entry.2 == trimmed));
+                assert!(free.iter().any(|entry| entry.2 == other));
+            }
+            assert!(ALLOC_RES.lock().unwrap().as_ref().unwrap().contains_key(&allocator));
+            release_allocator_res(allocator);
+            trim_free_scratch(trimmed);
+            trim_free_scratch(other);
+        }
     }
 
     #[test]
