@@ -22,6 +22,7 @@ mod cpu_writes;
 pub mod dred;
 pub mod driver_crash;
 mod fence_x;
+mod gpu_profile;
 mod format_alias;
 pub mod frame;
 pub mod flight;

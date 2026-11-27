@@ -3535,13 +3535,17 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             }
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
             let m1 = super::culprit::before_dispatch(list, raw_pso, pso, [n, 1, 1]);
+            let t1 = super::gpu_profile::begin(this, [raw_pso, pso], super::gpu_profile::Kind::Dispatch, [n, 1, 1]);
             list.Dispatch(n, 1, 1);
+            super::gpu_profile::end(this, t1);
             super::culprit::after_dispatch(list, m1);
             emit_uav_barrier(list, Some(&res_buf));
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
             // (the mesh pass: what the marker says is its groups; 0x3e2 marks a mesh draw in the log)
             let m2 = super::culprit::before_dispatch(list, raw_pso, pso, [n * tp.mesh_groups_per_record, 0x3e2, 1]);
+            let t2 = super::gpu_profile::begin(this, [raw_pso, pso], super::gpu_profile::Kind::Draw, [n * tp.mesh_groups_per_record, 1, 0]);
             pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
+            super::gpu_profile::end(this, t2);
             super::culprit::after_dispatch(list, m2);
             emit_uav_barrier(list, Some(&res_buf));
             with(this, |s| {
@@ -3662,7 +3666,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     bind_two_pass_stage(this, list, pso, &tp, res_va, compute)?;
                     let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
                     let mark = super::culprit::before_dispatch(list, raw_pso, pso, [0, 0, if compute { 1 } else { 0x3e2 }]);
+                    let t = super::gpu_profile::begin(this, [raw_pso, pso], if compute { super::gpu_profile::Kind::IndirectDispatch } else { super::gpu_profile::Kind::IndirectDraw }, [1, 0, 0]);
                     pc(this, s, 1, scaled.as_raw() as usize, first + k as u64 * msig.byte_stride as u64, 0, 0);
+                    super::gpu_profile::end(this, t);
                     super::culprit::after_dispatch(list, mark);
                     emit_uav_barrier(list, Some(&res_buf));
                 }
@@ -3816,7 +3822,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let Some((p, _)) = commands_at.filter(|&(_, n)| n >= 12) {
             super::culprit::indirect_args(mark, p);
         }
-        match chained_indirect(
+        let t = super::gpu_profile::begin(this, [raw_pso, pso], super::gpu_profile::Kind::IndirectDispatch, [max, 0, 0]);
+        let chained = chained_indirect(
             this,
             list,
             pso,
@@ -3827,7 +3834,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             (count_buf, count_off_title, count_off),
             preset_io,
             ei,
-        ) {
+        );
+        super::gpu_profile::end(this, t);
+        match chained {
             Ok(true) => {
                 super::culprit::after_dispatch(list, mark);
                 if super::ambient::has_compute_psos() {
@@ -3907,11 +3916,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             if let Some((p, _)) = commands_at.filter(|&(_, n)| n >= 12) {
                 super::culprit::indirect_args(mark, p);
             }
+            let t = super::gpu_profile::begin(this, [with(this, |s| s.pso), pso], if gfx { super::gpu_profile::Kind::IndirectDraw } else { super::gpu_profile::Kind::IndirectDispatch }, [max, 0, 0]);
             if guarded.is_some() && count_buf == 0 {
                 pc(this, sig, max, args, args_off, count_buf, count_off);
             } else {
                 fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
             }
+            super::gpu_profile::end(this, t);
             super::culprit::after_dispatch(list, mark);
             if compute {
                 if super::ambient::has_compute_psos() {
@@ -4180,7 +4191,9 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
+        let t = super::gpu_profile::begin(this, [with(this, |s| s.pso), 0], super::gpu_profile::Kind::Draw, [vertices, instances, 0]);
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        super::gpu_profile::end(this, t);
         if super::ambient::has_sky_psos() {
             let pso = pso_for_draw(with(this, |s| s.pso));
             super::ambient::after_draw(this, pso);
@@ -4226,7 +4239,10 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     base_vertex: i32,
     first_instance: u32,
 ) {
+    let this = list.as_raw();
+    let t = super::gpu_profile::begin(this, [with(this, |s| s.pso), 0], super::gpu_profile::Kind::Draw, [indices, instances, 0]);
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    super::gpu_profile::end(this, t);
 }
 
 /// The pipeline a draw (or an ExecuteIndirect) uses now: both graphics and compute pipelines wait
@@ -4746,7 +4762,9 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     let (limit, [x, y, z]) = fold(x, y, z);
     bind_abi(this, list, pso, false, limit, None)?;
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
+    let t = super::gpu_profile::begin(this, [with(this, |s| s.pso), pso], super::gpu_profile::Kind::Dispatch, [x, y, z]);
     let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
+    super::gpu_profile::end(this, t);
     super::culprit::after_dispatch(list, mark);
     if super::ambient::has_compute_psos() {
         let (layout, args, view_heap) = with(this, |s| (s.layout.clone(), s.args.clone(), s.heaps[0]));

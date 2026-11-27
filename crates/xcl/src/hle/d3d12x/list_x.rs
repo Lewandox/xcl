@@ -4098,6 +4098,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     // (a submit as `ExecuteCommandLists` is, for `prof`: the refresh, the waits and the driver)
     let _prof = super::prof::span(super::prof::Kind::Submit);
     super::title_textures::refresh(q_raw);
+    super::gpu_profile::note_queue(q_raw);
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
 

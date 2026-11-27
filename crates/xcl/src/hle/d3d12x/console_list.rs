@@ -1036,7 +1036,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
                         let mark = super::culprit::before_dispatch(&list, (*p).pc, real, [x, y, z]);
+                        let t = super::gpu_profile::begin(list.as_raw(), [(*p).pc, real], super::gpu_profile::Kind::Dispatch, [x, y, z]);
                         let r = super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z]);
+                        super::gpu_profile::end(list.as_raw(), t);
                         super::culprit::after_dispatch(&list, mark);
                         r?;
                         out.dispatches += 1;

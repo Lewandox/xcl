@@ -2204,6 +2204,11 @@ pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
     PSO_SHADERS.read().unwrap().as_ref()?.get(&pso).copied()
 }
 
+/// The console shaders of pipeline `pso` ((CS, 0) or (VS, PS)), for `XCL_GPU_PROFILE`.
+pub(super) fn note_pso_shaders(pso: usize, shaders: (u64, u64)) {
+    PSO_SHADERS.write().unwrap().get_or_insert_with(HashMap::new).insert(pso, shaders);
+}
+
 pub fn is_translated_graphics(pso: usize) -> bool {
     pso != 0 && TRANSLATED_GRAPHICS.read().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
@@ -6844,7 +6849,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
             super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
             TRANSLATED_GRAPHICS.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
             note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
-            if super::present::trace_frame() {
+            if super::present::trace_frame() || super::gpu_profile::on() {
                 PSO_SHADERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps_hash));
             }
             if n < 5 || n % 1000 == 0 {
@@ -6946,6 +6951,9 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     super::ambient::note_graphics_pso(*ppv as usize, shader_bytes(&d.PS));
     TRANSLATED_GRAPHICS.write().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+    if super::gpu_profile::on() && !super::present::trace_frame() {
+        note_pso_shaders(*ppv as usize, (crate::gpu::shader::fnv64(vs), shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64)));
+    }
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.write().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
@@ -7533,6 +7541,7 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     let hr = create_compute_pso(this, desc, riid, ppv);
     if hr >= 0 && !ppv.is_null() {
         super::culprit::note_compute(*ppv as usize, desc);
+        super::gpu_profile::note_title_compute(*ppv as usize, desc, wave32_only(this));
     }
     hr
 }
@@ -9671,6 +9680,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         super::vram::wait_pending_mappings(q);
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    super::gpu_profile::note_queue(this);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         // a list still on the GPU from its previous submit: that one first (the PC does not take
         // a list again before then)
