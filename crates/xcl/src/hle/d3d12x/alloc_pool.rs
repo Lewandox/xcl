@@ -313,6 +313,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     super::flight::signaled("title", key, &fence, value);
     // (how many PC lists that value stands for: 0 is a signal alone)
     super::flight::event("title lists", key as u64, value, lists.len() as u64);
+    super::culprit::submitted(key, value, &lists.iter().map(|&l| l as usize).collect::<Vec<_>>());
     for &l in lists {
         if let Some(&b) = s.of_list.get(&(l as usize)) {
             let entry = s.backings.entry(b).or_default();

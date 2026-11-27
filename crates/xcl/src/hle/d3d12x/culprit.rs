@@ -120,6 +120,7 @@ pub unsafe fn before_dispatch(list: &ID3D12GraphicsCommandList, title_pso: usize
     };
     m.what.insert(id, (key, format!("cs {:016x}, pipeline {pso:#x}, {size}", cs_of(title_pso, pso))));
     m.order.push_back(id);
+    record(&mut RECORDED.lock().unwrap(), key, id);
     if m.order.len() > REMEMBERED {
         let old = m.order.pop_front().unwrap();
         m.what.remove(&old);
@@ -127,6 +128,55 @@ pub unsafe fn before_dispatch(list: &ID3D12GraphicsCommandList, title_pso: usize
     let p = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: m.gpu + slot as u64 * 8, Value: id };
     l2.WriteBufferImmediate(1, &p, Some(&D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN));
     id
+}
+
+/// The dispatches numbered on each PC list since its last submit (`submitted` takes them).
+static RECORDED: Mutex<Option<HashMap<usize, Vec<u32>>>> = Mutex::new(None);
+/// The newest submits of title queues: (queue, its value after the submit, each list with the
+/// dispatches numbered on it). A stalled queue's first value not done names the lists the GPU
+/// is in, and the markers alone do not: a list whose dispatches are all done can still be the
+/// one that does not end (a copy, a clear, a barrier that waits for an earlier shader).
+static SUBMITS: Mutex<VecDeque<(usize, u64, Vec<(usize, Vec<u32>)>)>> = Mutex::new(VecDeque::new());
+/// Submits remembered, and the dispatches remembered of one list's recording.
+const SUBMITS_KEPT: usize = 128;
+const LIST_DISPATCHES_KEPT: usize = 1024;
+
+fn record(recorded: &mut Option<HashMap<usize, Vec<u32>>>, list: usize, id: u32) {
+    let v = recorded.get_or_insert_with(HashMap::new).entry(list).or_default();
+    if v.len() < LIST_DISPATCHES_KEPT {
+        v.push(id);
+    }
+}
+
+/// The dispatches numbered on `lists` since their last submit, taken.
+fn take_recorded(recorded: &mut Option<HashMap<usize, Vec<u32>>>, lists: &[usize]) -> Vec<(usize, Vec<u32>)> {
+    let Some(m) = recorded.as_mut() else { return lists.iter().map(|&l| (l, Vec::new())).collect() };
+    lists.iter().map(|&l| (l, m.remove(&l).unwrap_or_default())).collect()
+}
+
+/// A title queue's submit of `lists` (PC lists), after which the queue's fence has `value`.
+pub fn submitted(queue: usize, value: u64, lists: &[usize]) {
+    if !enabled() {
+        return;
+    }
+    let taken = take_recorded(&mut RECORDED.lock().unwrap(), lists);
+    let mut g = SUBMITS.lock().unwrap();
+    g.push_back((queue, value, taken));
+    if g.len() > SUBMITS_KEPT {
+        g.pop_front();
+    }
+}
+
+/// What a list's pair of words says of its dispatch `id`: the list's newest number in is at or
+/// past it once the work before it has started, its newest number out once it is done.
+fn state_of(id: u32, in_: u32, out: u32) -> &'static str {
+    if out >= id {
+        "done"
+    } else if in_ >= id {
+        "started"
+    } else {
+        "not started"
+    }
 }
 
 /// Where in title memory the arguments of the indirect dispatches numbered so are (the newest
@@ -250,11 +300,50 @@ fn report() {
             crate::xlog_warn!("GPU culprit:   #{id}: {s}{}", args_now(*id));
         }
     }
+    // the newest submits, with what was on their lists (the first report and a device removal)
+    static SUBMIT_REPORTS: AtomicU32 = AtomicU32::new(0);
+    if SUBMIT_REPORTS.fetch_add(1, Ordering::Relaxed) >= 2 {
+        return;
+    }
+    let submits = SUBMITS.lock().unwrap();
+    crate::xlog_warn!("GPU culprit: the newest {} submits of title queues (queue, value, lists with their dispatches):", submits.len());
+    for (queue, value, lists) in submits.iter() {
+        let total: usize = lists.iter().map(|(_, d)| d.len()).sum();
+        crate::xlog_warn!("GPU culprit:  queue {queue:#x} value {value}: {} lists, {total} dispatches", lists.len());
+        for (list, ids) in lists.iter().filter(|(_, d)| !d.is_empty()) {
+            // SAFETY: slots index the mapped buffer of SLOTS pairs
+            let (i, o) = m.slots.get(list).map_or((0, 0), |&s| unsafe { (std::ptr::read_volatile(m.cpu.add(s as usize * 2)), std::ptr::read_volatile(m.cpu.add(s as usize * 2 + 1))) });
+            let shown: Vec<String> = ids.iter().take(48).map(|id| format!("#{id} {} ({})", m.what.get(id).map_or("forgotten", |w| w.1.split(',').next().unwrap_or("")), state_of(*id, i, o))).collect();
+            crate::xlog_warn!("GPU culprit:    list {list:#x} (in #{i}, out #{o}): {}{}", shown.join(", "), if ids.len() > 48 { ", …" } else { "" });
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A submit takes the dispatches numbered on its lists since their last submit, and a
+    /// list's words say which of them the GPU has started and finished.
+    #[test]
+    fn a_submit_takes_its_lists_dispatches_and_the_words_give_their_state() {
+        let mut rec = None;
+        record(&mut rec, 0x10, 5);
+        record(&mut rec, 0x20, 6);
+        record(&mut rec, 0x10, 7);
+        assert_eq!(take_recorded(&mut rec, &[0x10, 0x30]), vec![(0x10, vec![5, 7]), (0x30, vec![])]);
+        // taken once: the list's next recording starts empty, the other list keeps its own
+        assert_eq!(take_recorded(&mut rec, &[0x10, 0x20]), vec![(0x10, vec![]), (0x20, vec![6])]);
+        assert_eq!(take_recorded(&mut None, &[0x10]), vec![(0x10, vec![])]);
+        // in #7, out #5: 5 is done, 7 has started, 9 has not
+        assert_eq!((state_of(5, 7, 5), state_of(7, 7, 5), state_of(9, 7, 5)), ("done", "started", "not started"));
+        // a recording never holds more than its cap
+        let mut rec = None;
+        for id in 0..(LIST_DISPATCHES_KEPT as u32 + 10) {
+            record(&mut rec, 1, id);
+        }
+        assert_eq!(take_recorded(&mut rec, &[1])[0].1.len(), LIST_DISPATCHES_KEPT);
+    }
 
     /// Only a list whose number in is above its number out has work in flight, and the
     /// dispatches logged for it are its own, after the out.
