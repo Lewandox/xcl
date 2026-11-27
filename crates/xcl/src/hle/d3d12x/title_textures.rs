@@ -548,11 +548,21 @@ fn is_small_cpu_filled_target(w: u64, h: u32, samples: u32, flags: u32) -> bool 
 }
 
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
-pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
+pub(super) unsafe fn register(
+    device: *mut c_void,
+    res: *mut c_void,
+    va: usize,
+    desc: &[u8; 0x38],
+    state: D3D12_RESOURCE_STATES,
+    precomputed_tex: Option<Arc<xg::Texture>>,
+) -> Result<(), String> {
     // (a new texture object, or the address of an old one again: its first upload is not left out)
     LAST_CONTENT.lock().unwrap().remove(&(res as usize));
     STREAM_RECHECK.lock().unwrap().remove(&(res as usize));
-    let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
+    let tex = match precomputed_tex {
+        Some(t) => t,
+        None => Arc::new(xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?),
+    };
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
     if matches!(u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap()), 116 | 117) {
@@ -599,7 +609,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         va,
         src,
         in_gpu_view,
-        tex: Arc::new(tex),
+        tex,
         states: vec![state],
         pending: true,
         gpu_written: false,
@@ -2715,7 +2725,7 @@ mod tests {
             ).unwrap();
             let texture: ID3D12Resource = texture.unwrap();
             let key = texture.as_raw() as usize;
-            register(raw_device, texture.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            register(raw_device, texture.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON, None).unwrap();
             let _registered = RegisteredTexture(key);
             for value in [0x3D, 0x9A] {
                 std::ptr::write_bytes(src as *mut u8, value, PAGE);
