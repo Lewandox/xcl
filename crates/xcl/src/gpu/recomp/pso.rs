@@ -234,7 +234,7 @@ mod translated {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) enum Backend {
         Hlsl,
-        /// direct DXIL for compute + the mesh pass (`=1`)
+        /// direct DXIL for compute passes (default or `=1`)
         DirectCompute,
         /// direct DXIL for VS / PS too (`=all`)
         DirectAll,
@@ -242,10 +242,15 @@ mod translated {
 
     impl Backend {
         pub(super) fn current() -> Self {
-            match (crate::gpu::dxil::kernel::enabled(), crate::gpu::dxil::kernel::enabled_graphics()) {
-                (_, true) => Backend::DirectAll,
-                (true, false) => Backend::DirectCompute,
-                _ => Backend::Hlsl,
+            Self::from_setting(std::env::var_os("XCL_DIRECT_DXIL").as_deref())
+        }
+
+        pub(super) fn from_setting(value: Option<&std::ffi::OsStr>) -> Self {
+            match value {
+                None => Self::DirectCompute,
+                Some(value) if value == "1" => Self::DirectCompute,
+                Some(value) if value == "all" => Self::DirectAll,
+                Some(_) => Self::Hlsl,
             }
         }
     }
@@ -618,9 +623,10 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
-    // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
-    // for what it cannot translate yet
-    if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+    use translated::Backend;
+    let backend = Backend::current();
+    // Compute shaders use direct DXIL by default and fall back to HLSL when needed.
+    if stage == Stage::Compute && backend != Backend::Hlsl {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -635,7 +641,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
     let ps_debug = stage == Stage::Pixel
         && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));
-    if matches!(stage, Stage::Vertex | Stage::Pixel) && !ps_debug && crate::gpu::dxil::kernel::enabled_graphics() {
+    if matches!(stage, Stage::Vertex | Stage::Pixel) && !ps_debug && backend == Backend::DirectAll {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -648,7 +654,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         }
     }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
-    if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
+    if enormous(stage, t.hlsl.len()) && backend == Backend::Hlsl {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -1163,8 +1169,8 @@ fn compile_console_mesh(
     windows: u32,
     split_wave64: bool,
 ) -> Result<Compiled, String> {
-    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
-    if crate::gpu::dxil::kernel::enabled() {
+    // The mesh compute pass follows the runtime's direct DXIL preference.
+    if translated::Backend::current() != translated::Backend::Hlsl {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -1288,8 +1294,8 @@ pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
 pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
-    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
-    if crate::gpu::dxil::kernel::enabled() {
+    // The geometry compute pass follows the runtime's direct DXIL preference.
+    if translated::Backend::current() != translated::Backend::Hlsl {
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
         match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
             Ok(k) => {
@@ -1842,6 +1848,21 @@ mod shader_cache_tests {
         let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || panic!("v2 entry was not reused")).unwrap();
         assert_eq!(second.dxil, first.dxil);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_dxil_defaults_to_the_explicit_compute_backend() {
+        use std::ffi::OsStr;
+        use translated::{identity_with, Backend};
+
+        let default = Backend::from_setting(None);
+        let compute = Backend::from_setting(Some(OsStr::new("1")));
+        assert_eq!(default, Backend::DirectCompute);
+        assert_eq!(default, compute);
+        assert_eq!(identity_with("s", "t", default, 1), identity_with("s", "t", compute, 1));
+        assert_eq!(Backend::from_setting(Some(OsStr::new("0"))), Backend::Hlsl);
+        assert_eq!(Backend::from_setting(Some(OsStr::new("all"))), Backend::DirectAll);
+        assert_eq!(Backend::from_setting(Some(OsStr::new(""))), Backend::Hlsl);
     }
 
     /// Direct DXIL entries have their own identity per routing mode and translator version;
