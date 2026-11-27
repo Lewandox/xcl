@@ -6,7 +6,9 @@
 //! retain unoccluded sky glare indoors.
 //!
 //! Controlled by `XCL_AMBIENT`:
-//! * `auto` (default): active only while `XCL_RT_GATE` is holding back BVH traversal.
+//! * `auto` (default): active while the title's rays find nothing: `XCL_RT_GATE` holds BVH
+//!   traversal back, or runs it with every ray missing (`miss`) – the probe resolve then gets as
+//!   little bounce light as when it is held, and the picture was as dark.
 //! * `sky` / `1` / `on`: always active.
 //! * `0` / `off` / `none`: disabled.
 //!
@@ -123,8 +125,13 @@ pub fn active() -> bool {
     match config().mode {
         Mode::Off => false,
         Mode::Sky => true,
-        Mode::Auto => !real::bvh_traversal_allowed(),
+        Mode::Auto => rays_find_nothing(real::bvh_traversal_allowed(), crate::gpu::dxil::kernel::rt_all_miss()),
     }
+}
+
+/// The title's rays bring no light: traversal is held back, or runs with every ray missing.
+fn rays_find_nothing(traversal_allowed: bool, every_ray_misses: bool) -> bool {
+    !traversal_allowed || every_ray_misses
 }
 
 /// Role of a console shader identified from FSSM/container metadata.
@@ -1571,6 +1578,16 @@ pub(super) unsafe fn after_compute_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stand-in is for a picture without bounce light: with traversal held back, and as much
+    /// with traversal running while every ray misses; not with rays that hit.
+    #[test]
+    fn the_stand_in_is_on_whenever_the_rays_find_nothing() {
+        assert!(rays_find_nothing(false, false), "traversal held back");
+        assert!(rays_find_nothing(true, true), "every ray misses");
+        assert!(rays_find_nothing(false, true));
+        assert!(!rays_find_nothing(true, false), "rays that hit bring the title's own light");
+    }
 
     #[test]
     fn mode_and_shader_classification_match_expected_passes() {
