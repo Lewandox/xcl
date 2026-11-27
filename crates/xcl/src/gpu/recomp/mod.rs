@@ -1874,9 +1874,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // (optimising one big dispatcher loop took minutes on large retail programs).
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
-        // Per-region loop budgets target compute spin-wait passes (PR #2793); keep graphics/mesh
-        // stages on the single-budget CFG.
-        let regions = if matches!(opt.mode, Mode::Compute(_) | Mode::Kernel) {
+        // Keep real compute/graphics/mesh shaders on the single-budget CFG so AMD LLPC
+        // (`amdxc64.dll+0xd2a411`, #2874) does not crash on multi-PHI per-region loop headers.
+        let regions = if matches!(opt.mode, Mode::Kernel) {
             budget_regions(&loops)
         } else {
             Vec::new()

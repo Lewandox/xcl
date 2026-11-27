@@ -1552,9 +1552,9 @@ fn gpu_an_endless_long_loop_stops_after_the_budget_by_its_cost() {
     assert_eq!(r.sgpr[0], (1 << 16) / 2);
 }
 
-/// Per-region loop budgets (`xcl_bown` / `xcl_btotal`) are compute-only: Compute and Kernel
-/// modes emit them for multi-region loops, while Pixel and Mesh stages keep the single-budget
-/// CFG (avoiding multi-PHI mesh loop headers that crash AMD LLPC).
+/// Per-region loop budgets (`xcl_bown` / `xcl_btotal`) stay on `Mode::Kernel` while real
+/// Compute, Pixel, and Mesh stages keep the single-budget CFG (avoiding multi-PHI loop headers
+/// that crash AMD LLPC at `amdxc64.dll+0xd2a411`, #2874).
 #[test]
 fn per_region_loop_budgets_are_compute_only() {
     let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
@@ -1569,13 +1569,11 @@ fn per_region_loop_budgets_are_compute_only() {
     let ps = super::PsInterface::default();
     let ms = super::MsInterface { threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() };
 
-    for mode in [Mode::Kernel, Mode::Compute(cs.clone())] {
+    let tk = translate(&code, &Options { mode: Mode::Kernel, ..Default::default() }).unwrap();
+    assert!(tk.hlsl.contains("xcl_bown") && tk.hlsl.contains("xcl_btotal"), "kernel should emit per-region budgets");
+    for mode in [Mode::Compute(cs.clone()), Mode::Pixel(ps), Mode::Mesh(ms.clone())] {
         let t = translate(&code, &Options { mode, ..Default::default() }).unwrap();
-        assert!(t.hlsl.contains("xcl_bown") && t.hlsl.contains("xcl_btotal"), "compute/kernel should emit per-region budgets");
-    }
-    for mode in [Mode::Pixel(ps), Mode::Mesh(ms.clone())] {
-        let t = translate(&code, &Options { mode, ..Default::default() }).unwrap();
-        assert!(!t.hlsl.contains("xcl_bown") && !t.hlsl.contains("xcl_btotal"), "pixel/mesh must not emit per-region budgets");
+        assert!(!t.hlsl.contains("xcl_bown") && !t.hlsl.contains("xcl_btotal"), "compute/pixel/mesh must not emit per-region budgets");
     }
 
     // Direct DXIL compute & mesh both translate cleanly for a multi-region loop program.
