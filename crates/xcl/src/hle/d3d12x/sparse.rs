@@ -43,15 +43,16 @@ const POOL_TILES: u32 = 64;
 /// they are unmapped together: 256 MB of video memory
 const PARKED_MAX: usize = 4096;
 /// bytes of the ring-buffered upload staging buffer
-const STAGING: usize = 64 << 20;
+const STAGING: usize = 16 << 20;
 /// alignment of sub-allocations inside the upload staging ring (write-combined cacheline)
 const RING_ALIGN: usize = 64;
 /// number of in-flight upload command allocators / lists
 const UPLOAD_SLOTS: usize = 16;
 /// bytes of the dedicated pre-zeroed buffer for tile/hole clears (1 MiB)
 const ZERO_BUF: usize = 1 << 20;
-/// bytes of the GPU→CPU readback staging buffer
-const READBACK_STAGING: usize = 16 << 20;
+/// bytes of the GPU→CPU readback staging buffer and maximum per readback job
+const READBACK_STAGING: usize = 4 << 20;
+const QUEUE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 const PAGE: usize = 0x1000;
 const PAGES_PER_TILE: usize = TILE / PAGE;
@@ -296,6 +297,8 @@ struct State {
     runs: Option<Vec<(usize, usize)>>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
+    /// Write-watch may already have been reset for pages with unsent CPU writes.
+    retry_pages: Vec<usize>,
 }
 
 impl Drop for State {
@@ -763,13 +766,18 @@ unsafe impl Send for State {}
 /// expires, so a late completion from an earlier timed-out wait cannot satisfy a newer wait early.
 /// (As in #1419 by gridoe and #2821 for `main`, same signature, so the two merge as one.)
 unsafe fn wait_fence_until(fence: &ID3D12Fence, event: HANDLE, target: u64, timeout: std::time::Duration) -> bool {
-    if target == 0 || fence.GetCompletedValue() >= target {
-        return true;
+    let completed = fence.GetCompletedValue();
+    if completed >= target {
+        return completed != u64::MAX;
     }
     let _ = windows::Win32::System::Threading::ResetEvent(event);
     let _ = fence.SetEventOnCompletion(target, event);
     let deadline = std::time::Instant::now() + timeout;
-    while fence.GetCompletedValue() < target {
+    loop {
+        let completed = fence.GetCompletedValue();
+        if completed >= target {
+            return completed != u64::MAX;
+        }
         let rem = deadline.saturating_duration_since(std::time::Instant::now());
         if rem.is_zero() {
             return false;
@@ -777,7 +785,6 @@ unsafe fn wait_fence_until(fence: &ID3D12Fence, event: HANDLE, target: u64, time
         let ms = rem.as_millis().clamp(1, u32::MAX as u128) as u32;
         windows::Win32::System::Threading::WaitForSingleObject(event, ms);
     }
-    true
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -975,6 +982,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             mapped_value: 0,
             runs: None,
             scratch_runs: Vec::new(),
+            retry_pages: Vec::new(),
         })
     })();
     match made {
@@ -1249,15 +1257,18 @@ impl State {
         super::flight::signaled("sparse", windows::core::Interface::as_raw(&self.queue) as usize, &self.fence, self.value);
     }
 
-    #[inline]
-    unsafe fn wait_for(&self, target: u64) {
-        if target == 0 || self.fence.GetCompletedValue() >= target {
-            return;
+    #[cfg(test)]
+    unsafe fn wait_for(&self, target: u64) -> bool {
+        self.wait_for_upload(target, QUEUE_WAIT_TIMEOUT)
+    }
+
+    unsafe fn wait_for_upload(&self, target: u64, timeout: std::time::Duration) -> bool {
+        if wait_fence_until(&self.fence, self.event, target, timeout) {
+            return true;
         }
-        if !wait_fence_until(&self.fence, self.event, target, std::time::Duration::from_secs(5)) {
-            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
-            super::real::stop_if_device_removed();
-        }
+        crate::xlog_warn!("sparse: the queue has not reached fence value {target} after {} ms (at {})", timeout.as_millis(), self.fence.GetCompletedValue());
+        super::real::stop_if_device_removed();
+        false
     }
 
     #[inline]
@@ -1278,7 +1289,7 @@ impl State {
     /// readback yet and must not be copied out.
     #[inline]
     unsafe fn wait_for_rb(&self, target: u64) -> bool {
-        if wait_fence_until(&self.rb_done_fence, self.event, target, std::time::Duration::from_secs(5)) {
+        if wait_fence_until(&self.rb_done_fence, self.event, target, QUEUE_WAIT_TIMEOUT) {
             return true;
         }
         crate::xlog_warn!(
@@ -1307,37 +1318,40 @@ impl State {
 
     /// Acquire the next upload command slot, waiting only if that slot's previous submission is
     /// still executing on the GPU, then reset its allocator and list.
-    unsafe fn begin_slot(&mut self) -> usize {
+    unsafe fn begin_slot(&mut self, timeout: std::time::Duration) -> Option<usize> {
         let idx = self.next_slot;
+        let fv = self.slots.get(idx)?.fence_val;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
-        let fv = self.slots[idx].fence_val;
-        if fv > 0 && self.fence.GetCompletedValue() < fv {
-            self.wait_for(fv);
+        if fv > 0 {
+            if !self.wait_for_upload(fv, timeout) {
+                return None;
+            }
             self.reclaim_ring();
         }
         let slot = &self.slots[idx];
-        let _ = slot.alloc.Reset();
-        let _ = slot.list.Reset(&slot.alloc, None);
-        idx
+        slot.alloc.Reset().ok()?;
+        slot.list.Reset(&slot.alloc, None).ok()?;
+        Some(idx)
     }
 
     /// Close and submit upload slot `idx` asynchronously (NO CPU wait — callers order GPU work
     /// via `queue.Wait(&self.fence, self.value)`).
-    unsafe fn submit_slot(&mut self, idx: usize) {
-        let closed = self.slots[idx].list.Close().is_ok();
-        if closed {
-            if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
-                super::title_textures::own_work(|| {
-                    self.queue.ExecuteCommandLists(&[Some(l)]);
-                });
-            }
-        }
+    unsafe fn submit_slot(&mut self, idx: usize) -> bool {
+        let list = &self.slots[idx].list;
+        let Ok(l) = list.Close().and_then(|()| list.cast::<ID3D12CommandList>()) else {
+            self.ring_write = self.ring_submitted;
+            return false;
+        };
+        super::title_textures::own_work(|| {
+            self.queue.ExecuteCommandLists(&[Some(l)]);
+        });
         self.signal();
         self.slots[idx].fence_val = self.value;
         if self.ring_write > self.ring_submitted {
             self.inflight.push_back((self.value, self.ring_write));
             self.ring_submitted = self.ring_write;
         }
+        true
     }
 
     unsafe fn staging_ptr(&mut self) -> Option<*mut u8> {
@@ -1444,6 +1458,41 @@ impl State {
         }
     }
 
+    /// Make the scanned hashes of unsent chunks differ on the next scan. Leave the hashes of
+    /// chunks already sent untouched, even when they share a CPU page with a retry.
+    fn invalidate_sent_range(&mut self, a: usize, n: usize) {
+        let end = a + n;
+        let mut at = a;
+        while at < end {
+            let page = at & !(PAGE - 1);
+            let tile = page & !(TILE - 1);
+            let page_end = (page + PAGE).min(end);
+            if let Some(sent) = self.mapped.get_mut(&tile).and_then(|entry| entry.sent[(page - tile) / PAGE].as_deref_mut()) {
+                for hash in &mut sent[(at - page) / CHUNK..(page_end - page).div_ceil(CHUNK)] {
+                    *hash ^= 1;
+                }
+            }
+            at = page_end;
+        }
+    }
+
+    fn retry_dirty_from(&mut self, runs: &[(usize, usize)], start: (usize, usize)) {
+        for (a, n) in unsent_runs(runs, start) {
+            self.invalidate_sent_range(a, n);
+            self.retry_pages.extend((a & !(PAGE - 1)..a + n).step_by(PAGE));
+        }
+    }
+
+    unsafe fn scan_retry_pages(&mut self, out: &mut Vec<(usize, usize)>) {
+        if self.retry_pages.is_empty() {
+            return;
+        }
+        self.retry_pages.sort_unstable();
+        self.retry_pages.dedup();
+        scan_dirty_pages_into(&mut self.mapped, &self.retry_pages, PAGE, scan_threads(), out);
+        self.retry_pages.clear();
+    }
+
     /// Update `sent` hashes for all 64-byte chunks overlapping `[va, va + len)` so the CPU
     /// copy-back we just wrote to `va` is not re-uploaded by the next `before_execute`.
     unsafe fn sync_sent_range(&mut self, va: usize, len: usize) {
@@ -1483,25 +1532,20 @@ impl State {
         let mut pending: Vec<(usize, usize, usize, Vec<Option<u64>>)> = Vec::new();
         let mut used = 0usize;
         let mut open = false;
-        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize, Vec<Option<u64>>)>, used: &mut usize, p: *mut u8| {
+        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize, Vec<Option<u64>>)>, used: &mut usize, p: *mut u8| -> bool {
             if *open {
                 *open = false;
                 s.order_rb_after_uploads();
-                if s.rb_list.Close().is_ok() {
-                    if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
-                        super::title_textures::own_work(|| {
-                            s.rb_queue.ExecuteCommandLists(&[Some(l)]);
-                        });
-                    }
-                }
+                let Ok(l) = s.rb_list.Close().and_then(|()| s.rb_list.cast::<ID3D12CommandList>()) else { return false };
+                super::title_textures::own_work(|| {
+                    s.rb_queue.ExecuteCommandLists(&[Some(l)]);
+                });
                 s.signal_rb();
                 s.rb_last_fence = s.rb_done_value;
-                let done = s.wait_for_rb(s.rb_done_value);
-                s.reclaim_ring();
-                if !done {
-                    // the GPU copy has not run: nothing to copy back yet
-                    pending.clear();
+                if !s.wait_for_rb(s.rb_done_value) {
+                    return false;
                 }
+                s.reclaim_ring();
             }
             for (dst, off, len, snap) in pending.iter() {
                 let (dst, off, len) = (*dst, *off, *len);
@@ -1548,6 +1592,7 @@ impl State {
             }
             pending.clear();
             *used = 0;
+            true
         };
         for &(a, n) in ranges {
             if n == 0 {
@@ -1564,15 +1609,15 @@ impl State {
                     done += (n - done).min(to_tile_end);
                     continue;
                 }
-                if used == READBACK_STAGING {
-                    flush_and_copy(self, &mut open, &mut pending, &mut used, p);
+                if used == READBACK_STAGING && !flush_and_copy(self, &mut open, &mut pending, &mut used, p) {
+                    return;
                 }
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
                 if !open {
-                    self.wait_for_rb(self.rb_last_fence);
-                    let _ = self.rb_alloc.Reset();
-                    let _ = self.rb_list.Reset(&self.rb_alloc, None);
+                    if !self.wait_for_rb(self.rb_last_fence) || self.rb_alloc.Reset().is_err() || self.rb_list.Reset(&self.rb_alloc, None).is_err() {
+                        return;
+                    }
                     open = true;
                 }
                 let snap_base = cur & !(CHUNK - 1);
@@ -1603,11 +1648,14 @@ impl State {
 
     /// Asynchronously zero `runs` (address, bytes) in sparse VRAM using the pre-zeroed `zero_buf`
     /// (zero staging ring bytes consumed, zero CPU stall).
-    unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)]) {
-        if runs.is_empty() || !self.ensure_zero_buf() {
-            return;
+    unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)], timeout: std::time::Duration) -> bool {
+        if runs.is_empty() {
+            return true;
         }
-        let slot_idx = self.begin_slot();
+        if !self.ensure_zero_buf() {
+            return false;
+        }
+        let Some(slot_idx) = self.begin_slot(timeout) else { return false };
         let mut last_wi: Option<usize> = None;
         let zero_buf = self.zero_buf.as_ref().unwrap();
         let list = &self.slots[slot_idx].list;
@@ -1632,28 +1680,33 @@ impl State {
                 done += chunk;
             }
         }
-        self.submit_slot(slot_idx);
+        self.submit_slot(slot_idx)
     }
 
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
-    /// the 64 MiB ring staging buffer (zero CPU stall on the common path).
-    unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) {
-        self.upload_runs(runs, &|at, p, n| {
+    /// the ring staging buffer. Preserve any unsent chunks when a submission stalls.
+    unsafe fn upload_dirty_with_timeout(&mut self, runs: &[(usize, usize)], timeout: std::time::Duration) -> bool {
+        if let Err(start) = self.upload_runs(runs, timeout, &|at, p, n| {
             std::ptr::copy_nonoverlapping(at as *const u8, p, n);
             true
-        });
+        }) {
+            self.retry_dirty_from(runs, start);
+            return false;
+        }
+        true
     }
 
     /// Copies `runs` (address in a window, bytes) into video memory; `read(address, to, bytes)`
     /// gives their bytes (false: the run's piece is left as it is).
-    unsafe fn upload_runs(&mut self, runs: &[(usize, usize)], read: &dyn Fn(usize, *mut u8, usize) -> bool) {
+    unsafe fn upload_runs(&mut self, runs: &[(usize, usize)], timeout: std::time::Duration, read: &dyn Fn(usize, *mut u8, usize) -> bool) -> Result<(), (usize, usize)> {
         if runs.is_empty() {
-            return;
+            return Ok(());
         }
-        let Some(p) = self.staging_ptr() else { return };
-        let mut open_slot: Option<usize> = None;
+        let p = self.staging_ptr().ok_or((0, 0))?;
+        // A failed Close invalidates this whole batch, including earlier runs recorded in it.
+        let mut open_slot: Option<(usize, (usize, usize))> = None;
         let mut last_wi: Option<usize> = None;
-        for &(a, n) in runs {
+        for (index, &(a, n)) in runs.iter().enumerate() {
             let mut done = 0usize;
             while done < n {
                 let cur = a + done;
@@ -1664,7 +1717,14 @@ impl State {
                             last_wi = Some(i);
                             i
                         }
-                        None => break,
+                        None => {
+                            if let Some((slot, start)) = open_slot.take() {
+                                if !self.submit_slot(slot) {
+                                    return Err(start);
+                                }
+                            }
+                            return Err((index, done));
+                        }
                     },
                 };
                 let b = self.windows[wi].0;
@@ -1673,22 +1733,26 @@ impl State {
                 if (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
                     self.reclaim_ring();
                     if (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
-                        if let Some(slot_idx) = open_slot.take() {
-                            self.submit_slot(slot_idx);
+                        if let Some((slot_idx, start)) = open_slot.take() {
+                            if !self.submit_slot(slot_idx) {
+                                return Err(start);
+                            }
                             self.reclaim_ring();
                         }
                         while (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
-                            let Some(&(fv, _)) = self.inflight.front() else { break };
-                            self.wait_for(fv);
+                            let &(fv, _) = self.inflight.front().ok_or((index, done))?;
+                            if !self.wait_for_upload(fv, timeout) {
+                                return Err((index, done));
+                            }
                             self.reclaim_ring();
                         }
                     }
                 }
                 let slot_idx = match open_slot {
-                    Some(idx) => idx,
+                    Some((idx, _)) => idx,
                     None => {
-                        let idx = self.begin_slot();
-                        open_slot = Some(idx);
+                        let idx = self.begin_slot(timeout).ok_or((index, done))?;
+                        open_slot = Some((idx, (index, done)));
                         idx
                     }
                 };
@@ -1703,10 +1767,20 @@ impl State {
                 done += chunk;
             }
         }
-        if let Some(slot_idx) = open_slot {
-            self.submit_slot(slot_idx);
+        if let Some((slot_idx, start)) = open_slot {
+            if !self.submit_slot(slot_idx) {
+                return Err(start);
+            }
         }
+        Ok(())
     }
+}
+
+fn unsent_runs(runs: &[(usize, usize)], (index, done): (usize, usize)) -> impl Iterator<Item = (usize, usize)> + '_ {
+    runs.iter().skip(index).enumerate().filter_map(move |(i, &(a, n))| {
+        let sent = if i == 0 { done } else { 0 };
+        (sent < n).then(|| (a + sent, n - sent))
+    })
 }
 
 /// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
@@ -2157,7 +2231,10 @@ pub unsafe fn readback_now(va: usize, len: usize) {
             for &(a, n) in &zeroed {
                 s.clear_sent_range(a, n);
             }
-            s.upload_zeros(&zeroed);
+            if !s.upload_zeros(&zeroed, QUEUE_WAIT_TIMEOUT) {
+                s.to_zero = zeroed;
+                return;
+            }
         }
         // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)` and snapshot
         // each 64-byte chunk's Phase-1 hash so Phase 3 never clobbers concurrent CPU writes.
@@ -2190,8 +2267,8 @@ pub unsafe fn readback_now(va: usize, len: usize) {
             }
             pg = tile_end;
         }
-        if !dirty_runs.is_empty() {
-            s.upload_dirty(&dirty_runs);
+        if !s.upload_dirty_with_timeout(&dirty_runs, QUEUE_WAIT_TIMEOUT) {
+            return;
         }
         let mut spans = Vec::new();
         let mut done = 0usize;
@@ -2771,17 +2848,19 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let mut dirty_runs = std::mem::take(&mut s.scratch_runs);
     dirty_runs.clear();
     scan_dirty_pages_into(&mut s.mapped, dirty, page, scan_threads(), &mut dirty_runs);
+    s.scan_retry_pages(&mut dirty_runs);
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
-    if !zero_runs.is_empty() {
-        s.upload_zeros(&zero_runs);
-    }
-    if !dirty_runs.is_empty() {
-        s.upload_dirty(&dirty_runs);
-    }
-    if gpu_view::on() {
+    let uploaded = if s.upload_zeros(&zero_runs, QUEUE_WAIT_TIMEOUT) {
+        s.upload_dirty_with_timeout(&dirty_runs, QUEUE_WAIT_TIMEOUT)
+    } else {
+        s.to_zero.extend_from_slice(&zero_runs);
+        s.retry_dirty_from(&dirty_runs, (0, 0));
+        false
+    };
+    if uploaded && gpu_view::on() {
         gpu_view::apply_sync(s, dirty, gpu_view_prep);
     }
     PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2789,7 +2868,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         static CALLS: AtomicU64 = AtomicU64::new(0);
         static BYTES: AtomicU64 = AtomicU64::new(0);
         static MICROS: AtomicU64 = AtomicU64::new(0);
-        let bytes: usize = zero_runs.iter().chain(dirty_runs.iter()).map(|r| r.1).sum();
+        let bytes: usize = if uploaded { zero_runs.iter().chain(dirty_runs.iter()).map(|r| r.1).sum() } else { 0 };
         let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         let b = BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
         let us = MICROS.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed) + t0.elapsed().as_micros() as u64;
@@ -3158,6 +3237,7 @@ mod tests {
             mapped_value: 0,
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
             };
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
@@ -3479,6 +3559,7 @@ mod tests {
             mapped_value: 0,
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
             };
 
             // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
@@ -3587,6 +3668,7 @@ mod tests {
             mapped_value: 0,
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
             };
 
             s.commit_range(base, TILE);
@@ -3688,7 +3770,6 @@ mod tests {
     unsafe fn test_state_with_reserved(tiles: usize) -> (usize, State) {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::*;
-        use windows_sys::Win32::System::Memory::MEM_RESERVE;
 
         let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
         let mut dev: Option<ID3D12Device> = None;
@@ -3699,6 +3780,12 @@ mod tests {
             D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
         }
         let dev = dev.expect("D3D12 device");
+        test_state_with_device(dev, tiles)
+    }
+
+    unsafe fn test_state_with_device(dev: ID3D12Device, tiles: usize) -> (usize, State) {
+        use windows_sys::Win32::System::Memory::MEM_RESERVE;
+
         let base = VirtualAlloc(std::ptr::null(), tiles * TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
         assert!(base != 0 && base % TILE == 0);
         let mut reserved: Option<ID3D12Resource> = None;
@@ -3758,8 +3845,82 @@ mod tests {
             mapped_value: 0,
             runs: None,
             scratch_runs: Vec::new(),
+            retry_pages: Vec::new(),
         };
         (base, s)
+    }
+
+    #[test]
+    fn sparse_stalled_upload_retries_only_unsent_chunks_without_a_new_cpu_write() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            assert_eq!(VirtualAlloc(base as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE) as usize, base);
+            std::ptr::write_bytes(base as *mut u8, 0x5a, PAGE);
+            s.commit_range(base, TILE);
+            s.wait_for(s.value);
+            s.sync_sent_range(base, PAGE);
+            let before = *s.mapped[&base].sent[0].as_deref().unwrap();
+
+            s.ring_write = STAGING as u64;
+            s.ring_submitted = s.ring_write;
+            s.inflight.push_back((s.value + 1, s.ring_write));
+            let runs = [(base + CHUNK, 2 * CHUNK)];
+            assert!(!s.upload_dirty_with_timeout(&runs, std::time::Duration::from_millis(20)));
+            let after = s.mapped[&base].sent[0].as_deref().unwrap();
+            assert_eq!(after[0], before[0]);
+            assert_eq!(after[3], before[3]);
+
+            let mut pending = Vec::new();
+            s.scan_retry_pages(&mut pending);
+            assert_eq!(pending, runs);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn sparse_staging_bounds_memory_and_transfers_larger_ranges() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let Some(dev) = test_device() else { return };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_1.0
+            {
+                crate::gpu::recomp::runner::skip_test("no tiled resources");
+                return;
+            }
+
+            let bytes = (16 << 20) + TILE;
+            let (base, mut s) = test_state_with_device(dev, bytes / TILE);
+            let alloc: ID3D12CommandAllocator = s.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = s.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.Close().unwrap();
+            s.slots.push(UploadSlot { alloc, list, fence_val: 0 });
+            assert_eq!(VirtualAlloc(base as *const c_void, bytes, MEM_COMMIT, PAGE_READWRITE) as usize, base);
+            s.commit_range(base, bytes);
+
+            let mut expected = vec![0; bytes];
+            for (i, tile) in expected.chunks_exact_mut(TILE).enumerate() {
+                tile.fill((i % 251 + 1) as u8);
+            }
+            s.upload_runs(&[(base, bytes)], QUEUE_WAIT_TIMEOUT, &|at, dst, len| {
+                expected[at - base..at - base + len].as_ptr().copy_to_nonoverlapping(dst, len);
+                true
+            }).unwrap();
+            s.readback_ranges(&[(base, bytes)]);
+            let copied = std::slice::from_raw_parts(base as *const u8, bytes);
+            assert!(copied == expected, "bytes must survive across upload wraps and readback batches");
+
+            let upload_bytes = s.staging.as_ref().unwrap().0.GetDesc().Width;
+            let readback_bytes = s.readback.as_ref().unwrap().0.GetDesc().Width;
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+            assert_eq!((upload_bytes, readback_bytes), (16 << 20, 4 << 20));
+        }
     }
 
     /// `flush_parked` must keep unmapped pool tiles out of `free` (and `take_tile` must not reuse

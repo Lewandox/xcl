@@ -283,10 +283,18 @@ impl State {
             }
             out
         }).collect();
-        self.upload_runs(&split, &|dst, p, len| {
+        if let Err(start) = self.upload_runs(&split, QUEUE_WAIT_TIMEOUT, &|dst, p, len| {
             let page = dst & !(PAGE - 1);
             from.get(&page).is_some_and(|r| read_title(r + (dst - page), p, len))
-        });
+        }) {
+            let mut retry_bytes = 0;
+            for (a, bytes) in unsent_runs(&split, start) {
+                self.invalidate_sent_range(a, bytes);
+                m.fresh.push(a & !(TILE - 1));
+                retry_bytes += bytes;
+            }
+            return n - retry_bytes;
+        }
         n
     }
 }
@@ -653,6 +661,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
             };
             let mut m = Mirrors::default();
             s.ensure_mapped(window, TILE, |_| query_tile_holes(source));
